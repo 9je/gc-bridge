@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -22,7 +25,7 @@ jobs:
             binary: gc-bridge.exe
             artifact: gc-bridge-windows-x64.exe
 
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             binary: gc-bridge
             artifact: gc-bridge-macos-intel
