@@ -185,7 +185,7 @@ sudo apt-get install -y \
 ### Build
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/gc-bridge
+git clone https://github.com/9je/gc-bridge
 cd gc-bridge
 cargo build --release
 # binary: target/release/gc-bridge  (or gc-bridge.exe on Windows)
