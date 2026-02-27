@@ -1,0 +1,30 @@
+[package]
+name = "gc-bridge"
+version = "0.1.0"
+edition = "2021"
+authors = ["conch.gg"]
+homepage = "conch.gg/visualizer"
+description = "A linking tool that allows GameCube controller visualization on conch.gg/visualization using client hosted a webhook"
+
+[dependencies]
+# Pure Rust async USB library
+nusb = "0.1"
+tokio = { version = "1", features = ["full"] }
+warp = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures = "0.3"
+eframe = "0.28"
+egui = "0.28"
+
+# Windows API for timer resolution control
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["timeapi"] }
+
+# Optimization profile
+[profile.release]
+opt-level = 3       # Maximize speed for 1000Hz polling
+lto = true          # Link Time Optimization
+codegen-units = 1   # Maximize optimization at cost of compile time
+panic = "abort"     # Remove stack unwind overhead
+strip = true        # Strip symbols for smaller binary
