@@ -173,7 +173,7 @@ On startup, GC Bridge waits ~40 frames per port before locking in a calibration.
 
 **Prerequisites:** Rust (install via [rustup.rs](https://rustup.rs))
 
-### Linux — extra system packages needed
+### Linux: extra system packages needed
 
 ```bash
 sudo apt-get install -y \
@@ -212,7 +212,7 @@ GC Adapter (USB)
       │  USB interrupt transfers @ ~1000 Hz
       ▼
   GC Bridge (Rust)
-      │  nusb — pure-Rust async USB
+      │  nusb, pure-Rust async USB
       │  Calibrates sticks/triggers on connect
       │  Computes Melee coordinates
       │
