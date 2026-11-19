@@ -106,12 +106,13 @@ type ControllerDataPacket = {
   port: number;        // 0–3
   connected: boolean;
   poll_rate: number;   // measured Hz (typically ~1000)
-  origins: OriginData; // calibrated neutral offsets
+  origins: OriginData; // the rest position subtracted from every reading
   samples: ControllerSample[];
 };
 
 type ControllerSample = {
-  timestamp: number;   // microseconds since adapter connection
+  timestamp: number;   // microseconds since the bridge started
+  raw: RawData;        // the bytes as the adapter sent them, before any subtraction
   buttons: {
     a: boolean; b: boolean; x: boolean; y: boolean;
     start: boolean; z: boolean;
@@ -138,12 +139,28 @@ type OriginData = {
   stick_x: number; stick_y: number;  // center offset as Melee float
   c_x: number;     c_y: number;
   l: number;       r: number;        // trigger neutral raw value
+  raw: RawData;                      // the snapshot as the adapter sent it
+  reason: "plug-in" | "bridge-start" | "x-y-start" | "request" | "none";
+  captured_ms: number;               // when it was taken, ms since the bridge started
+  version: 2;                        // absent on v0.1.0
+};
+
+type RawData = {
+  stick_x: number; stick_y: number; c_x: number; c_y: number;  // 0–255, 128 is centre
+  l: number; r: number;                                        // 0–255
 };
 ```
 
 ### Calibration
 
-On startup, GC Bridge waits ~40 frames per port before locking in a calibration. Keep the sticks and triggers at neutral when first plugging in a controller. The `origins` field in each packet reports the detected offsets so your app can apply them independently if needed.
+A GameCube controller takes its origin (the stick and trigger positions it treats as rest) when it powers up, and again when X+Y+Start is held for three seconds; the console subtracts it from every reading. The adapter doesn't pass that origin along, so GC Bridge takes the same snapshot at the same moments:
+
+- `plug-in`: ~40 polls after a controller is plugged in while the bridge is running.
+- `bridge-start`: the controller was already plugged in when the bridge started, so the snapshot is from then, not from when the controller took its own origin.
+- `x-y-start`: X+Y+Start held for three seconds.
+- `request`: the page asked for a retake.
+
+Keep the sticks and triggers still at those moments. To ask for a retake, send a text message `{"cmd":"retake_origin","port":0}`.
 
 ### Example message
 
@@ -153,9 +170,12 @@ On startup, GC Bridge waits ~40 frames per port before locking in a calibration.
     "port": 0,
     "connected": true,
     "poll_rate": 1000,
-    "origins": { "stick_x": 0.0125, "stick_y": -0.025, "c_x": 0.0, "c_y": 0.0, "l": 0, "r": 0 },
+    "origins": { "stick_x": 0.0125, "stick_y": -0.025, "c_x": 0.0, "c_y": 0.0, "l": 0, "r": 0,
+                 "raw": { "stick_x": 129, "stick_y": 126, "c_x": 128, "c_y": 128, "l": 0, "r": 0 },
+                 "reason": "plug-in", "captured_ms": 5120, "version": 2 },
     "samples": [{
       "timestamp": 4823910,
+      "raw": { "stick_x": 130, "stick_y": 124, "c_x": 128, "c_y": 128, "l": 0, "r": 0 },
       "buttons": { "a": true, "b": false, "x": false, "y": false, "start": false,
                    "z": false, "l": false, "r": false,
                    "d_left": false, "d_right": false, "d_up": false, "d_down": false },
