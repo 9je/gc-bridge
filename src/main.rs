@@ -213,6 +213,7 @@ impl OriginTracker {
             self.seen_unplugged = true;
             self.xys_since = None;
             self.xys_done = false;
+            self.retake = false;   // nothing to retake; a later plug-in takes its own
             return;
         }
         self.polls = self.polls.saturating_add(1);
@@ -794,6 +795,16 @@ mod origin_tests {
         let ms = run(&mut t, pad(128, 128), 0, 50);
         t.update(&gone(), ms);
         assert!(t.origin().is_none());
+    }
+
+    #[test]
+    fn retake_asked_while_unplugged_is_dropped() {
+        let mut t = OriginTracker::default();
+        let ms = run(&mut t, gone(), 0, 5);
+        t.request_retake();
+        let ms = run(&mut t, gone(), ms, 5);
+        run(&mut t, pad(128, 128), ms, 41);
+        assert_eq!(t.origin().unwrap().reason, OriginReason::PlugIn);
     }
 
     #[test]
