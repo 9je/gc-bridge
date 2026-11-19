@@ -61,11 +61,17 @@ struct TriggerData { l: u8, r: u8 }
 #[derive(Serialize, Clone, Debug)]
 struct OriginData {
     stick_x: f32, stick_y: f32, c_x: f32, c_y: f32, l: u8, r: u8,
+    // Since 0.2: the snapshot as the adapter sent it, and when and why it was taken.
+    raw: RawData,
+    reason: &'static str,
+    captured_ms: u64,
+    version: u8,
 }
 
 #[derive(Serialize, Clone, Debug)]
 struct ControllerSample {
     timestamp: u128,
+    raw: RawData,
     buttons: ButtonsData,
     stick: StickData,
     c_stick: StickData,
@@ -86,10 +92,6 @@ struct BridgeUpdate {
     controllers: Vec<ControllerDataPacket>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ControllerCalibration {
-    stick: (u8, u8), c_stick: (u8, u8), triggers: (u8, u8),
-}
 
 // --- (UNCHANGED: melee_coord_clamp, parse_gc_input, RawControllerInput) ---
 fn melee_coord_clamp(x_in: i16, y_in: i16) -> (f32, f32) {
@@ -147,13 +149,119 @@ struct RawControllerInput {
     stick_x: u8, stick_y: u8, c_stick_x: u8, c_stick_y: u8, trigger_l: u8, trigger_r: u8,
 }
 
+
+// --- Origins ---
+//
+// A GameCube controller takes its origin (the stick and trigger positions it
+// treats as rest) when it powers up, and again when X+Y+Start is held for
+// three seconds. The console subtracts that origin from every reading. The
+// adapter does not pass the controller's origin message along, so the bridge
+// takes the same snapshot itself at the same moments, and says when and why.
+
+const ORIGIN_SETTLE_POLLS: u32 = 40;   // let the first reports settle after connect
+const XYS_HOLD_MS: u64 = 3000;         // the controller's own re-origin hold
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OriginReason { PlugIn, BridgeStart, XYStart, Request }
+
+impl OriginReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            OriginReason::PlugIn => "plug-in",
+            OriginReason::BridgeStart => "bridge-start",
+            OriginReason::XYStart => "x-y-start",
+            OriginReason::Request => "request",
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RawData { stick_x: u8, stick_y: u8, c_x: u8, c_y: u8, l: u8, r: u8 }
+
+impl RawData {
+    fn of(i: &RawControllerInput) -> Self {
+        RawData {
+            stick_x: i.stick_x, stick_y: i.stick_y, c_x: i.c_stick_x, c_y: i.c_stick_y,
+            l: i.trigger_l, r: i.trigger_r,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Origin { raw: RawData, reason: OriginReason, captured_ms: u64 }
+
+#[derive(Default)]
+struct OriginTracker {
+    origin: Option<Origin>,
+    polls: u32,
+    seen_unplugged: bool,
+    xys_since: Option<u64>,
+    xys_done: bool,
+    retake: bool,
+}
+
+impl OriginTracker {
+    fn origin(&self) -> Option<Origin> { self.origin }
+
+    fn request_retake(&mut self) { self.retake = true; }
+
+    /// One adapter report for this port at `now_ms` (ms since the bridge started).
+    fn update(&mut self, input: &RawControllerInput, now_ms: u64) {
+        if !input.connected {
+            self.origin = None;
+            self.polls = 0;
+            self.seen_unplugged = true;
+            self.xys_since = None;
+            self.xys_done = false;
+            return;
+        }
+        self.polls = self.polls.saturating_add(1);
+        let take = |reason| Some(Origin { raw: RawData::of(input), reason, captured_ms: now_ms });
+
+        if self.origin.is_none() && self.polls > ORIGIN_SETTLE_POLLS {
+            let reason = if self.seen_unplugged { OriginReason::PlugIn } else { OriginReason::BridgeStart };
+            self.origin = take(reason);
+        }
+        if self.retake && self.polls > ORIGIN_SETTLE_POLLS {
+            self.retake = false;
+            self.origin = take(OriginReason::Request);
+        }
+        if input.x && input.y && input.start {
+            let since = *self.xys_since.get_or_insert(now_ms);
+            if !self.xys_done && now_ms - since >= XYS_HOLD_MS {
+                self.xys_done = true;
+                self.origin = take(OriginReason::XYStart);
+            }
+        } else {
+            self.xys_since = None;
+            self.xys_done = false;
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClientCommand { RetakeOrigin(usize) }
+
+#[derive(serde::Deserialize)]
+struct ClientCommandJson { cmd: String, port: Option<usize> }
+
+/// A text message from the page. Only {"cmd":"retake_origin","port":0..3} for now.
+fn parse_client_command(text: &str) -> Option<ClientCommand> {
+    let c: ClientCommandJson = serde_json::from_str(text).ok()?;
+    match (c.cmd.as_str(), c.port) {
+        ("retake_origin", Some(p)) if p < 4 => Some(ClientCommand::RetakeOrigin(p)),
+        _ => None,
+    }
+}
+
 // --- FIXED App State ---
 struct AppSharedState {
     adapter_status: String,
     server_ready: bool,
     client_connected: bool,
     ports: [PortMetadata; 4],
-    calibrations: [Option<ControllerCalibration>; 4],
+    origins: [Option<Origin>; 4],
+    retake: [bool; 4],
     setup_hint: Option<String>,
 }
 
@@ -314,24 +422,22 @@ async fn handle_client(
                         let samples: Vec<ControllerSample> = port_buffers[i].drain(..).collect();
                         let hz = state_guard.ports[i].poll_rate;
 
-                        let origins = if let Some(cal) = state_guard.calibrations[i] {
-                            let stick_x_offset = (cal.stick.0 as i16) - 128;
-                            let stick_y_offset = (cal.stick.1 as i16) - 128;
-                            let c_x_offset = (cal.c_stick.0 as i16) - 128;
-                            let c_y_offset = (cal.c_stick.1 as i16) - 128;
-
-                            OriginData {
-                                stick_x: stick_x_offset as f32 / 80.0,
-                                stick_y: stick_y_offset as f32 / 80.0,
-                                c_x: c_x_offset as f32 / 80.0,
-                                c_y: c_y_offset as f32 / 80.0,
-                                l: cal.triggers.0,
-                                r: cal.triggers.1,
+                        let origins = match state_guard.origins[i] {
+                            Some(o) => {
+                                let m = |v: u8| (v as i16 - 128) as f32 / 80.0;
+                                OriginData {
+                                    stick_x: m(o.raw.stick_x), stick_y: m(o.raw.stick_y),
+                                    c_x: m(o.raw.c_x), c_y: m(o.raw.c_y),
+                                    l: o.raw.l, r: o.raw.r,
+                                    raw: o.raw, reason: o.reason.as_str(),
+                                    captured_ms: o.captured_ms, version: 2,
+                                }
                             }
-                        } else {
-                            OriginData {
+                            None => OriginData {
                                 stick_x: 0.0, stick_y: 0.0, c_x: 0.0, c_y: 0.0, l: 0, r: 0,
-                            }
+                                raw: RawData { stick_x: 128, stick_y: 128, c_x: 128, c_y: 128, l: 0, r: 0 },
+                                reason: "none", captured_ms: 0, version: 2,
+                            },
                         };
 
                         controllers_out.push(ControllerDataPacket {
@@ -351,7 +457,16 @@ async fn handle_client(
             }
 
             msg = ws_rx.next() => {
-                if msg.is_none() { break; }
+                match msg {
+                    None | Some(Err(_)) => break,
+                    Some(Ok(m)) => {
+                        if let Ok(text) = m.to_str() {
+                            if let Some(ClientCommand::RetakeOrigin(p)) = parse_client_command(text) {
+                                if let Ok(mut s) = shared_state.lock() { s.retake[p] = true; }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -367,8 +482,9 @@ async fn start_adapter_polling(
     shutdown_signal: Arc<AtomicBool>,
     broadcast_tx: tokio::sync::broadcast::Sender<PollMessage>,
 ) {
-    let mut calibrations: Vec<Option<ControllerCalibration>> = vec![None; 4];
-    let mut frame_counters: Vec<u32> = vec![0; 4];
+    // Timestamps and origin times count from here (the bridge's start).
+    let start = Instant::now();
+    let mut trackers: Vec<OriginTracker> = (0..4).map(|_| OriginTracker::default()).collect();
     let mut polls_sec: Vec<u32> = vec![0; 4];
     let mut last_hz_time = Instant::now();
 
@@ -465,50 +581,40 @@ ATTRS{idProduct}==\"0337\", MODE=\"0666\"' \
                 None => continue,
             };
 
-            for (i, input) in inputs.iter().enumerate() {
-                if !input.connected {
-                    calibrations[i] = None;
-                    frame_counters[i] = 0;
-                    if let Ok(mut s) = shared_state.lock() {
-                        s.ports[i].connected = false;
-                        s.calibrations[i] = None;
-                    }
-                    continue;
+            let now_ms = now.duration_since(start).as_millis() as u64;
+            if let Ok(mut s) = shared_state.lock() {
+                for (flag, tracker) in s.retake.iter_mut().zip(trackers.iter_mut()) {
+                    if *flag { *flag = false; tracker.request_retake(); }
                 }
+            }
 
+            for (i, input) in inputs.iter().enumerate() {
+                trackers[i].update(input, now_ms);
+                let origin = trackers[i].origin();
                 if let Ok(mut s) = shared_state.lock() {
-                    s.ports[i].connected = true;
+                    s.ports[i].connected = input.connected;
+                    s.origins[i] = origin;
                 }
+                if !input.connected { continue; }
 
                 polls_sec[i] += 1;
-                frame_counters[i] += 1;
 
-                if frame_counters[i] > 40 && calibrations[i].is_none() {
-                    let new_cal = ControllerCalibration {
-                        stick: (input.stick_x, input.stick_y),
-                        c_stick: (input.c_stick_x, input.c_stick_y),
-                        triggers: (input.trigger_l, input.trigger_r),
-                    };
-                    calibrations[i] = Some(new_cal);
-                    if let Ok(mut s) = shared_state.lock() {
-                        s.calibrations[i] = Some(new_cal);
-                    }
-                }
-
-                let cal = calibrations[i].unwrap_or(ControllerCalibration {
-                    stick: (128, 128), c_stick: (128, 128), triggers: (0, 0),
+                let cal = origin.map(|o| o.raw).unwrap_or(RawData {
+                    stick_x: 128, stick_y: 128, c_x: 128, c_y: 128, l: 0, r: 0,
                 });
 
-                let sx = (input.stick_x as i16) - (cal.stick.0 as i16);
-                let sy = (input.stick_y as i16) - (cal.stick.1 as i16);
+                let sx = (input.stick_x as i16) - (cal.stick_x as i16);
+                let sy = (input.stick_y as i16) - (cal.stick_y as i16);
                 let (mx, my) = melee_coord_clamp(sx, sy);
 
-                let cx = (input.c_stick_x as i16) - (cal.c_stick.0 as i16);
-                let cy = (input.c_stick_y as i16) - (cal.c_stick.1 as i16);
+                let cx = (input.c_stick_x as i16) - (cal.c_x as i16);
+                let cy = (input.c_stick_y as i16) - (cal.c_y as i16);
                 let (mcx, mcy) = melee_coord_clamp(cx, cy);
 
                 let sample = ControllerSample {
-                    timestamp: now.elapsed().as_micros(),
+                    // v0.1.0 used now.elapsed() right after now, so every stamp was ~0.
+                    timestamp: now.duration_since(start).as_micros(),
+                    raw: RawData::of(input),
                     buttons: ButtonsData {
                         a: input.a, b: input.b, x: input.x, y: input.y,
                         start: input.start, z: input.z, l: input.l, r: input.r,
@@ -518,8 +624,8 @@ ATTRS{idProduct}==\"0337\", MODE=\"0666\"' \
                     stick: StickData { x: sx, y: sy, melee_x: mx, melee_y: my },
                     c_stick: StickData { x: cx, y: cy, melee_x: mcx, melee_y: mcy },
                     triggers: TriggerData {
-                        l: input.trigger_l.saturating_sub(cal.triggers.0),
-                        r: input.trigger_r.saturating_sub(cal.triggers.1),
+                        l: input.trigger_l.saturating_sub(cal.l),
+                        r: input.trigger_r.saturating_sub(cal.r),
                     },
                 };
 
@@ -543,7 +649,8 @@ async fn main() {
         server_ready: false,
         client_connected: false,
         ports: [PortMetadata { connected: false, poll_rate: 0 }; 4],
-        calibrations: [None; 4],
+        origins: [None; 4],
+        retake: [false; 4],
         setup_hint: None,
     }));
 
@@ -608,4 +715,91 @@ async fn main() {
 
     eframe::run_native("GC Bridge", options, Box::new(|_cc| Ok(Box::new(app)))).unwrap();
     reset_timer_resolution();
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    fn pad(sx: u8, sy: u8) -> RawControllerInput {
+        RawControllerInput {
+            connected: true, stick_x: sx, stick_y: sy,
+            c_stick_x: 128, c_stick_y: 128, trigger_l: 30, trigger_r: 0,
+            ..Default::default()
+        }
+    }
+    fn gone() -> RawControllerInput { RawControllerInput::default() }
+
+    fn run(t: &mut OriginTracker, input: RawControllerInput, from_ms: u64, polls: u64) -> u64 {
+        for i in 0..polls { t.update(&input, from_ms + i); }
+        from_ms + polls
+    }
+
+    #[test]
+    fn connected_from_first_packet_is_bridge_start() {
+        let mut t = OriginTracker::default();
+        run(&mut t, pad(130, 127), 0, 39);
+        assert!(t.origin().is_none(), "no origin before the settle delay");
+        run(&mut t, pad(130, 127), 39, 2);
+        let o = t.origin().unwrap();
+        assert_eq!(o.reason, OriginReason::BridgeStart);
+        assert_eq!((o.raw.stick_x, o.raw.stick_y, o.raw.l), (130, 127, 30));
+    }
+
+    #[test]
+    fn seen_unplugged_first_is_plug_in() {
+        let mut t = OriginTracker::default();
+        let ms = run(&mut t, gone(), 0, 10);
+        run(&mut t, pad(128, 128), ms, 41);
+        assert_eq!(t.origin().unwrap().reason, OriginReason::PlugIn);
+        assert_eq!(t.origin().unwrap().captured_ms, ms + 40);
+    }
+
+    #[test]
+    fn x_y_start_for_three_seconds_retakes() {
+        let mut t = OriginTracker::default();
+        let ms = run(&mut t, pad(128, 128), 0, 50);
+        let mut held = pad(140, 120);
+        held.x = true; held.y = true; held.start = true;
+        run(&mut t, held, ms, 3001);
+        let o = t.origin().unwrap();
+        assert_eq!(o.reason, OriginReason::XYStart);
+        assert_eq!((o.raw.stick_x, o.raw.stick_y), (140, 120));
+    }
+
+    #[test]
+    fn x_y_start_short_hold_does_not_retake() {
+        let mut t = OriginTracker::default();
+        let ms = run(&mut t, pad(128, 128), 0, 50);
+        let mut held = pad(140, 120);
+        held.x = true; held.y = true; held.start = true;
+        run(&mut t, held, ms, 2900);
+        assert_eq!(t.origin().unwrap().reason, OriginReason::BridgeStart);
+    }
+
+    #[test]
+    fn requested_retake_happens_on_next_poll() {
+        let mut t = OriginTracker::default();
+        let ms = run(&mut t, pad(128, 128), 0, 50);
+        t.request_retake();
+        t.update(&pad(126, 129), ms);
+        let o = t.origin().unwrap();
+        assert_eq!(o.reason, OriginReason::Request);
+        assert_eq!((o.raw.stick_x, o.raw.stick_y, o.captured_ms), (126, 129, ms));
+    }
+
+    #[test]
+    fn disconnect_clears_origin() {
+        let mut t = OriginTracker::default();
+        let ms = run(&mut t, pad(128, 128), 0, 50);
+        t.update(&gone(), ms);
+        assert!(t.origin().is_none());
+    }
+
+    #[test]
+    fn retake_command_parses() {
+        assert_eq!(parse_client_command(r#"{"cmd":"retake_origin","port":2}"#), Some(ClientCommand::RetakeOrigin(2)));
+        assert_eq!(parse_client_command(r#"{"cmd":"retake_origin","port":7}"#), None);
+        assert_eq!(parse_client_command("nonsense"), None);
+    }
 }
