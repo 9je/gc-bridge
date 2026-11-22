@@ -531,9 +531,14 @@ ATTRS{idProduct}==\"0337\", MODE=\"0666\"' \
             }
         };
 
-        let interface = match device.claim_interface(0) {
+        // On Linux, adapters that also present as HID get usbhid bound to
+        // this interface; detach it first. Same as claim_interface elsewhere.
+        let interface = match device.detach_and_claim_interface(0) {
             Ok(i) => i,
-            Err(_) => {
+            Err(e) => {
+                if let Ok(mut s) = shared_state.lock() {
+                    s.adapter_status = format!("Can't claim adapter: {e}");
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }

@@ -15,7 +15,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Oldest supported runner, so the binary runs on older glibc (Ubuntu 22.04+).
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             binary: gc-bridge
             artifact: gc-bridge-linux-x64
@@ -49,7 +50,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
